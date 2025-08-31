@@ -600,11 +600,9 @@ class AudioProcessor:
         if not self.beg_loop:
             self.beg_loop = time()
 
-        if not message:
-            logger.info("Empty audio message received, initiating stop sequence.")
-            self.is_stopping = True
-            # Signal FFmpeg manager to stop accepting data
-            await self.ffmpeg_manager.stop()
+        # Ignore empty/keepalive frames instead of stopping the pipeline
+        if message is None or (hasattr(message, '__len__') and len(message) == 0):
+            logger.debug("Empty audio chunk ignored (keepalive).")
             return
 
         if self.is_stopping:

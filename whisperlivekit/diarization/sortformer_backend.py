@@ -246,8 +246,13 @@ class SortformerDiarizationOnline:
             preds_np = self.total_preds[0].cpu().numpy()
             total_pred_count = len(preds_np)
             
+            # Handle model/reset that shrank the accumulated predictions (NeMo may roll window)
+            if total_pred_count < self._processed_pred_count:
+                print(f"⚠️ DIARIZATION DEBUG: Model prediction window reset (was {self._processed_pred_count}, now {total_pred_count}). Continuing from processed_time={self.processed_time:.2f}s")
+                self._processed_pred_count = 0
+
             # Only process new predictions since last time
-            if total_pred_count <= self._processed_pred_count:
+            if total_pred_count == self._processed_pred_count:
                 return
                 
             # Get only the new predictions
@@ -279,8 +284,12 @@ class SortformerDiarizationOnline:
             
             with self.segment_lock:
                 # Process predictions into segments
-                # Use the actual time based on processed predictions
-                base_time = self._processed_pred_count * frame_duration + self.global_time_offset
+                # Use the actual time based on processed predictions. If the model reset (processed count 0
+                # while we already advanced processed_time), continue from processed_time to avoid gaps.
+                if self._processed_pred_count == 0 and self.processed_time > 0:
+                    base_time = self.processed_time
+                else:
+                    base_time = self._processed_pred_count * frame_duration + self.global_time_offset
                 
                 for idx, spk in enumerate(active_speakers):
                     start_time = base_time + idx * frame_duration
