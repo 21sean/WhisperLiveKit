@@ -62,9 +62,9 @@ class SortformerDiarization:
 
             if torch.cuda.is_available():
                 self.diar_model.to(torch.device("cuda"))
-                logger.info("Using CUDA for Sortformer model")
+                print("Using CUDA for Sortformer model")
             else:
-                logger.info("Using CPU for Sortformer model")
+                print("Using CPU for Sortformer model")
 
             self.diar_model.sortformer_modules.chunk_len = 10
             self.diar_model.sortformer_modules.subsampling_factor = 10
@@ -72,8 +72,10 @@ class SortformerDiarization:
             self.diar_model.sortformer_modules.chunk_left_context = 10
             self.diar_model.sortformer_modules.spkcache_len = 188
             self.diar_model.sortformer_modules.fifo_len = 188
-            self.diar_model.sortformer_modules.spkcache_update_period = 144
+            self.diar_model.sortformer_modules.spkcache_update_period = 72  # Reduced from 144 for more frequent updates
             self.diar_model.sortformer_modules.log = False
+            # Force the model to consider multiple speakers
+            self.diar_model.sortformer_modules.n_spk = 4  # Ensure 4-speaker capability is active
             self.diar_model.sortformer_modules._check_streaming_parameters()
                         
         except Exception as e:
@@ -159,6 +161,9 @@ class SortformerDiarizationOnline:
         
         # Initialize total predictions tensor
         self.total_preds = torch.zeros((batch_size, 0, self.diar_model.sortformer_modules.n_spk), device=device)
+        
+        # Track how many predictions we've already processed
+        self._processed_pred_count = 0
 
     def insert_silence(self, silence_duration: float):
         """
@@ -212,6 +217,9 @@ class SortformerDiarizationOnline:
                 left_offset = 8 if self._chunk_index > 0 else 0
                 right_offset = 8
                 
+                # Debug: log chunk processing
+                print(f"🎵 DIARIZATION: Processing chunk {self._chunk_index} (time: {self._chunk_index * self.chunk_duration_seconds:.2f}s)")
+                
                 self.streaming_state, self.total_preds = self.diar_model.forward_streaming_step(
                     processed_signal=chunk_feat_seq_t,
                     processed_signal_length=torch.tensor([chunk_feat_seq_t.shape[1]], device=self.diar_model.device),
@@ -236,49 +244,78 @@ class SortformerDiarizationOnline:
         """Process model predictions and convert to speaker segments."""
         try:
             preds_np = self.total_preds[0].cpu().numpy()
-            active_speakers = np.argmax(preds_np, axis=1)
+            total_pred_count = len(preds_np)
+            
+            # Only process new predictions since last time
+            if total_pred_count <= self._processed_pred_count:
+                return
+                
+            # Get only the new predictions
+            new_preds = preds_np[self._processed_pred_count:]
+            active_speakers = np.argmax(new_preds, axis=1)
             
             # Debug logging to see what speakers are being predicted
             unique_speakers = np.unique(active_speakers)
             print(f"🔍 DIARIZATION DEBUG: Predicted speakers in this chunk: {unique_speakers}")
+            print(f"🔍 DIARIZATION DEBUG: New predictions: {len(new_preds)}, Total predictions: {total_pred_count}")
             print(f"🔍 DIARIZATION DEBUG: Speaker distribution: {[(spk, np.sum(active_speakers == spk)) for spk in unique_speakers]}")
             
-            if self._len_prediction is None:
-                self._len_prediction = len(active_speakers)
+            # Force model to consider multiple speakers if stuck on one
+            if len(unique_speakers) == 1 and self._chunk_index > 3:
+                print(f"⚠️ DIARIZATION WARNING: Only detecting speaker {unique_speakers[0]} for multiple chunks")
+                # Show raw prediction probabilities for debugging
+                if len(new_preds) > 0:
+                    last_frame_probs = new_preds[-1]
+                    print(f"🔍 DIARIZATION DEBUG: Raw probabilities for last frame: {last_frame_probs}")
+                    print(f"🔍 DIARIZATION DEBUG: Max probability: {np.max(last_frame_probs):.3f} for speaker {np.argmax(last_frame_probs)}")
             
-            # Get predictions for current chunk
-            frame_duration = self.chunk_duration_seconds / self._len_prediction
-            current_chunk_preds = active_speakers[-self._len_prediction:]
+            # Calculate frame duration based on the model's subsampling factor and window stride
+            # The model outputs one prediction per frame after subsampling
+            # Frame duration = subsampling_factor * window_stride
+            frame_duration = (self.diar_model.sortformer_modules.subsampling_factor * 
+                            self.diar_model.preprocessor._cfg.window_stride)
+            frames_per_chunk = len(new_preds)
+            print(f"🔍 DIARIZATION DEBUG: Frame duration: {frame_duration:.3f}s, Frames in chunk: {frames_per_chunk}")
             
             with self.segment_lock:
                 # Process predictions into segments
-                base_time = self._chunk_index * self.chunk_duration_seconds + self.global_time_offset
+                # Use the actual time based on processed predictions
+                base_time = self._processed_pred_count * frame_duration + self.global_time_offset
                 
-                for idx, spk in enumerate(current_chunk_preds):
+                for idx, spk in enumerate(active_speakers):
                     start_time = base_time + idx * frame_duration
                     end_time = base_time + (idx + 1) * frame_duration
                     
                     # Check if this continues the last segment or starts a new one
                     if (self.speaker_segments and 
                         self.speaker_segments[-1].speaker == spk and 
-                        abs(self.speaker_segments[-1].end - start_time) < frame_duration * 2.0):  # Increased tolerance
+                        abs(self.speaker_segments[-1].end - start_time) < frame_duration * 1.0):  # Reduced tolerance for better speaker separation
                         # Continue existing segment
                         self.speaker_segments[-1].end = end_time
                     else:
                         # Create new segment
-                        self.speaker_segments.append(SpeakerSegment(
+                        new_segment = SpeakerSegment(
                             speaker=spk,
                             start=start_time,
                             end=end_time
-                        ))
+                        )
+                        self.speaker_segments.append(new_segment)
+                        
+                        # Log when a new speaker is detected
+                        if not self.speaker_segments[:-1] or all(seg.speaker != spk for seg in self.speaker_segments[:-1][-10:]):
+                            print(f"🎤 DIARIZATION: New speaker {spk} detected at {start_time:.2f}s")
                 
                 # Merge very short segments with adjacent ones from the same speaker
                 self._consolidate_segments()
                 
+                # Update processed prediction count
+                self._processed_pred_count = total_pred_count
+                
                 # Update processed time
-                self.processed_time = max(self.processed_time, base_time + self.chunk_duration_seconds)
+                self.processed_time = max(self.processed_time, base_time + frames_per_chunk * frame_duration)
                 
                 logger.debug(f"Processed chunk {self._chunk_index}, total segments: {len(self.speaker_segments)}")
+                print(f"🔍 DIARIZATION DEBUG: Processed {len(new_preds)} new predictions, total processed: {self._processed_pred_count}")
                 
         except Exception as e:
             logger.error(f"Error processing predictions: {e}")
