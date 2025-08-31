@@ -66,16 +66,13 @@ class SortformerDiarization:
             else:
                 print("Using CPU for Sortformer model")
 
-            self.diar_model.sortformer_modules.chunk_len = 10
-            self.diar_model.sortformer_modules.subsampling_factor = 10
-            self.diar_model.sortformer_modules.chunk_right_context = 0
-            self.diar_model.sortformer_modules.chunk_left_context = 10
-            self.diar_model.sortformer_modules.spkcache_len = 188
+            # Low latency streaming configuration (per model card; values are in 80ms frames)
+            self.diar_model.sortformer_modules.chunk_len = 6
+            self.diar_model.sortformer_modules.chunk_right_context = 7
             self.diar_model.sortformer_modules.fifo_len = 188
-            self.diar_model.sortformer_modules.spkcache_update_period = 72  # Reduced from 144 for more frequent updates
+            self.diar_model.sortformer_modules.spkcache_update_period = 144
+            self.diar_model.sortformer_modules.spkcache_len = 188
             self.diar_model.sortformer_modules.log = False
-            # Force the model to consider multiple speakers
-            self.diar_model.sortformer_modules.n_spk = 4  # Ensure 4-speaker capability is active
             self.diar_model.sortformer_modules._check_streaming_parameters()
                         
         except Exception as e:
