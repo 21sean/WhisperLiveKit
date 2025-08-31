@@ -122,16 +122,9 @@ def format_output(state, silence, current_time, diarization, debug):
             if speaker == -2 or previous_speaker == -2: #silences can happen anytime
                 lines.append(new_line(token, speaker, last_end_diarized, debug_info = ""))
                 continue
-            elif next_punctuation_change(i, tokens):
-                # Corrects advance:
-                # Are you |SPLIT SPEAKER| okay? yeah, sure. Absolutely 
-                # should become:
-                # Are you okay? |SPLIT SPEAKER| yeah, sure. Absolutely 
-                append_token_to_last_line(lines, sep, token, debug_info, last_end_diarized)
-                continue
-            else: #we create a new speaker, but that's no ideal. We are not sure about the split. We prefer to append to previous line
-                # lines.append(new_line(token, speaker, last_end_diarized, debug_info = ""))
-                pass
+            # Always respect diarization speaker assignments
+            lines.append(new_line(token, speaker, last_end_diarized, debug_info = ""))
+            continue
             
         append_token_to_last_line(lines, sep, token, debug_info, last_end_diarized)
     return lines, undiarized_text, buffer_transcription, '' 

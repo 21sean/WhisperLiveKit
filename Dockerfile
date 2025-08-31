@@ -27,23 +27,20 @@ ENV PATH="/opt/venv/bin:$PATH"
 # timeout/retries for large torch wheels
 RUN pip3 install --upgrade pip setuptools wheel && \
     pip3 --disable-pip-version-check install --timeout=120 --retries=5 \
-        --index-url https://download.pytorch.org/whl/cu129 \
+        --index-url https://download.pytorch.org/whl/cu121 \
         torch torchaudio \
     || (echo "Initial install failed — retrying with extended timeout..." && \
         pip3 --disable-pip-version-check install --timeout=300 --retries=3 \
-            --index-url https://download.pytorch.org/whl/cu129 \
-            torch torchvision torchaudio)
+            --index-url https://download.pytorch.org/whl/cu121 \
+            torch torchaudio)
 
 COPY . .
 
-# Install WhisperLiveKit directly, allowing for optional dependencies
-RUN if [ -n "$EXTRAS" ]; then \
-      echo "Installing with extras: [$EXTRAS]"; \
-      pip install --no-cache-dir whisperlivekit[$EXTRAS]; \
-    else \
-      echo "Installing base package only"; \
-      pip install --no-cache-dir whisperlivekit; \
-    fi
+# Install NeMo for Sortformer backend
+RUN pip install "git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]"
+
+# Install WhisperLiveKit from local copy (with our device fixes)
+RUN pip install --no-cache-dir .
 
 # In-container caching for Hugging Face models by: 
 # A) Make the cache directory persistent via an anonymous volume.
@@ -80,4 +77,4 @@ EXPOSE 8000
 
 ENTRYPOINT ["whisperlivekit-server", "--host", "0.0.0.0"]
 
-CMD ["--model", "medium"]
+CMD ["--model", "medium", "--diarization"]

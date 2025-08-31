@@ -107,6 +107,11 @@ class SortformerDiarizationOnline:
             pad_to=0
         )
         
+        # Move audio preprocessor to the same device as the model
+        if hasattr(self.diar_model, 'device'):
+            self.audio2mel = self.audio2mel.to(self.diar_model.device)
+            logger.info(f"Moved audio2mel preprocessor to device: {self.diar_model.device}")
+        
         self.chunk_duration_seconds = (
             self.diar_model.sortformer_modules.chunk_len * 
             self.diar_model.sortformer_modules.subsampling_factor * 
@@ -209,7 +214,7 @@ class SortformerDiarizationOnline:
                 
                 self.streaming_state, self.total_preds = self.diar_model.forward_streaming_step(
                     processed_signal=chunk_feat_seq_t,
-                    processed_signal_length=torch.tensor([chunk_feat_seq_t.shape[1]]),
+                    processed_signal_length=torch.tensor([chunk_feat_seq_t.shape[1]], device=self.diar_model.device),
                     streaming_state=self.streaming_state,
                     total_preds=self.total_preds,
                     left_offset=left_offset,
@@ -233,6 +238,11 @@ class SortformerDiarizationOnline:
             preds_np = self.total_preds[0].cpu().numpy()
             active_speakers = np.argmax(preds_np, axis=1)
             
+            # Debug logging to see what speakers are being predicted
+            unique_speakers = np.unique(active_speakers)
+            print(f"🔍 DIARIZATION DEBUG: Predicted speakers in this chunk: {unique_speakers}")
+            print(f"🔍 DIARIZATION DEBUG: Speaker distribution: {[(spk, np.sum(active_speakers == spk)) for spk in unique_speakers]}")
+            
             if self._len_prediction is None:
                 self._len_prediction = len(active_speakers)
             
@@ -251,17 +261,19 @@ class SortformerDiarizationOnline:
                     # Check if this continues the last segment or starts a new one
                     if (self.speaker_segments and 
                         self.speaker_segments[-1].speaker == spk and 
-                        abs(self.speaker_segments[-1].end - start_time) < frame_duration * 0.5):
+                        abs(self.speaker_segments[-1].end - start_time) < frame_duration * 2.0):  # Increased tolerance
                         # Continue existing segment
                         self.speaker_segments[-1].end = end_time
                     else:
-                        
                         # Create new segment
                         self.speaker_segments.append(SpeakerSegment(
                             speaker=spk,
                             start=start_time,
                             end=end_time
                         ))
+                
+                # Merge very short segments with adjacent ones from the same speaker
+                self._consolidate_segments()
                 
                 # Update processed time
                 self.processed_time = max(self.processed_time, base_time + self.chunk_duration_seconds)
@@ -270,6 +282,26 @@ class SortformerDiarizationOnline:
                 
         except Exception as e:
             logger.error(f"Error processing predictions: {e}")
+
+    def _consolidate_segments(self):
+        """Consolidate short segments and merge adjacent segments from the same speaker."""
+        if len(self.speaker_segments) < 2:
+            return
+            
+        consolidated = []
+        current = self.speaker_segments[0]
+        
+        for next_segment in self.speaker_segments[1:]:
+            # If same speaker and close timing, merge them
+            if (current.speaker == next_segment.speaker and 
+                next_segment.start - current.end < 0.5):  # Gap less than 0.5 seconds
+                current.end = next_segment.end
+            else:
+                consolidated.append(current)
+                current = next_segment
+        
+        consolidated.append(current)
+        self.speaker_segments = consolidated
 
     def assign_speakers_to_tokens(self, tokens: list, use_punctuation_split: bool = False) -> list:
         """
@@ -289,17 +321,58 @@ class SortformerDiarizationOnline:
             logger.debug("No segments or tokens available for speaker assignment")
             return tokens
         
-        logger.debug(f"Assigning speakers to {len(tokens)} tokens using {len(segments)} segments")
+        print(f"🔍 DIARIZATION DEBUG: Assigning speakers to {len(tokens)} tokens using {len(segments)} segments")
+        
+        # Debug logging: show available segments
+        for i, segment in enumerate(segments[-5:]):  # Show last 5 segments
+            print(f"🔍 DIARIZATION DEBUG: Segment {i}: Speaker {segment.speaker} from {segment.start:.2f}s to {segment.end:.2f}s")
+        
         use_punctuation_split = False
         if not use_punctuation_split:
-            # Simple overlap-based assignment
+            # Simple overlap-based assignment with improved logic
             for token in tokens:
                 token.speaker = -1  # Default to no speaker
+                best_overlap = 0.0
+                best_speaker = -1
+                
                 for segment in segments:
-                    # Check for timing overlap
-                    if not (segment.end <= token.start or segment.start >= token.end):
-                        token.speaker = segment.speaker + 1  # Convert to 1-based indexing
-                        break
+                    # Calculate overlap between token and segment
+                    overlap_start = max(token.start, segment.start)
+                    overlap_end = min(token.end, segment.end)
+                    overlap_duration = max(0, overlap_end - overlap_start)
+                    
+                    if overlap_duration > best_overlap:
+                        best_overlap = overlap_duration
+                        best_speaker = segment.speaker + 1  # Convert to 1-based indexing
+                
+                # If we found any overlap, assign the speaker
+                if best_overlap > 0:
+                    token.speaker = best_speaker
+                    print(f"🔍 DIARIZATION DEBUG: Token '{token.text}' ({token.start:.2f}-{token.end:.2f}s) assigned to Speaker {token.speaker} (overlap: {best_overlap:.2f}s)")
+                else:
+                    # If no overlap, assign to the closest segment
+                    closest_distance = float('inf')
+                    closest_speaker = -1
+                    
+                    for segment in segments:
+                        # Distance to segment
+                        if token.end <= segment.start:
+                            distance = segment.start - token.end
+                        elif token.start >= segment.end:
+                            distance = token.start - segment.end
+                        else:
+                            distance = 0  # Token is within segment
+                        
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_speaker = segment.speaker + 1
+                    
+                    # If very close to a segment (within 1 second), assign to it
+                    if closest_distance < 1.0 and closest_speaker != -1:
+                        token.speaker = closest_speaker
+                        print(f"🔍 DIARIZATION DEBUG: Token '{token.text}' ({token.start:.2f}-{token.end:.2f}s) assigned to closest Speaker {token.speaker} (distance: {closest_distance:.2f}s)")
+                    else:
+                        print(f"🔍 DIARIZATION DEBUG: Token '{token.text}' ({token.start:.2f}-{token.end:.2f}s) got no speaker assignment (closest distance: {closest_distance:.2f}s)")
         else:
             # Use punctuation-aware assignment (similar to diart_backend)
             tokens = self._add_speaker_to_tokens_with_punctuation(segments, tokens)
